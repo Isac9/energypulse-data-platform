@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EnergyPulse</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root { --bg:#0f1720; --card:#17212b; --ink:#e6edf3; --muted:#8b98a5; --line:#26323d;
+          --ok:#2fbf71; --warn:#e8a33d; --bad:#e5534b; --accent:#4cc2ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.45 system-ui, sans-serif; background:var(--bg); color:var(--ink); }
+  header { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between;
+           padding:16px 24px; border-bottom:1px solid var(--line); }
+  h1 { font-size:20px; margin:0; } h1 span { color:var(--accent); }
+  h2 { font-size:15px; margin:0 0 10px; color:var(--muted); font-weight:600; }
+  main { padding:20px 24px; display:grid; gap:16px; grid-template-columns:repeat(12, 1fr); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; min-width:0; }
+  .kpi { grid-column:span 3; } .kpi b { display:block; font-size:28px; margin-top:4px; }
+  .wide { grid-column:span 8; } .side { grid-column:span 4; } .full { grid-column:span 12; }
+  select, button { background:var(--card); color:var(--ink); border:1px solid var(--line); border-radius:6px; padding:6px 10px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+  .pill { padding:2px 8px; border-radius:99px; font-size:12px; font-weight:600; }
+  .ok { background:#1d3b2b; color:var(--ok); } .warning { background:#3d3020; color:var(--warn); }
+  .breach, .critical, .failed, .open { background:#3d2222; color:var(--bad); }
+  .success, .closed { background:#1d3b2b; color:var(--ok); } .skipped, .half_open { background:#3d3020; color:var(--warn); }
+  .scroll { max-height:340px; overflow:auto; }
+  @media (max-width:900px) { .kpi { grid-column:span 6; } .wide, .side { grid-column:span 12; }
+    main, header { padding-left:16px; padding-right:16px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Energy<span>Pulse</span> — production, météo et santé du pipeline</h1>
+  <div>Zone :
+    <select id="ba"><option>CISO</option><option>ERCO</option><option>PJM</option><option>NYIS</option></select>
+    <button id="refresh">Actualiser</button>
+  </div>
+</header>
+<main>
+  <div class="card kpi"><h2>Part renouvelable (24 h)</h2><b id="k-ren">–</b></div>
+  <div class="card kpi"><h2>Pic de demande (24 h)</h2><b id="k-peak">–</b></div>
+  <div class="card kpi"><h2>Dernière heure reçue</h2><b id="k-last">–</b></div>
+  <div class="card kpi"><h2>Incidents ouverts</h2><b id="k-inc">–</b></div>
+
+  <div class="card wide"><h2>Production par filière (MW) — 7 derniers jours de données</h2><canvas id="c-mix" height="120"></canvas></div>
+  <div class="card side"><h2>Solaire vs rayonnement</h2><canvas id="c-solar" height="220"></canvas></div>
+
+  <div class="card full"><h2>Contrôles SLA (dernier résultat)</h2><div class="scroll"><table id="t-sla"></table></div></div>
+  <div class="card wide"><h2>Incidents</h2><div class="scroll"><table id="t-inc"></table></div></div>
+  <div class="card side"><h2>Sources (disjoncteur)</h2><table id="t-src"></table></div>
+  <div class="card full"><h2>Dernières exécutions d'ingestion</h2><div class="scroll"><table id="t-runs"></table></div></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const get = url => fetch(url).then(r => r.ok ? r.json() : []);
+const pill = s => `<span class="pill ${s}">${s}</span>`;
+const fmt = d => d ? new Date(d).toISOString().slice(0,16).replace('T',' ') : '–';
+const num = v => v == null ? '–' : Number(v).toLocaleString('fr-FR', {maximumFractionDigits:1});
+let charts = {};
+
+function table(el, rows, cols) {
+  if (!rows.length) { el.innerHTML = '<tr><td>Aucune donnée</td></tr>'; return; }
+  el.innerHTML = '<tr>' + cols.map(c => `<th>${c[0]}</th>`).join('') + '</tr>' +
+    rows.map(r => '<tr>' + cols.map(c => `<td>${c[1](r)}</td>`).join('') + '</tr>').join('');
+}
+function draw(id, config) { charts[id]?.destroy(); charts[id] = new Chart($(id), config); }
+Chart.defaults.color = '#8b98a5'; Chart.defaults.borderColor = '#26323d';
+
+async function load() {
+  const ba = $('ba').value;
+  const [rows, sla, inc, pipe] = await Promise.all([
+    get(`/generation/${ba}?hours=168`), get('/sla'), get('/incidents?open_only=false&limit=50'), get('/pipeline')]);
+
+  const last24 = rows.slice(-24);
+  const sum = k => last24.reduce((a, r) => a + Number(r[k] || 0), 0);
+  $('k-ren').textContent = last24.length ? (100 * sum('renewable_mw') / sum('gross_mw')).toFixed(1) + ' %' : '–';
+  $('k-peak').textContent = last24.length ? num(Math.max(...last24.map(r => Number(r.demand_mw || 0)))) + ' MW' : '–';
+  $('k-last').textContent = rows.length ? fmt(rows.at(-1).period_utc) : '–';
+  $('k-inc').textContent = inc.filter(i => !i.resolved_at).length;
+
+  const labels = rows.map(r => fmt(r.period_utc));
+  const series = [['Gaz','gas_mw','#e8a33d'],['Charbon','coal_mw','#7d6b5d'],['Nucléaire','nuclear_mw','#b083f0'],
+                  ['Hydraulique','hydro_mw','#4c8dff'],['Éolien','wind_mw','#2fbf71'],['Solaire','solar_mw','#f5d547']];
+  draw('c-mix', { type:'line', data:{ labels, datasets: series.map(([l,k,c]) => ({ label:l, data:rows.map(r => r[k] || 0),
+      fill:true, backgroundColor:c+'99', borderColor:c, pointRadius:0, borderWidth:1 })) },
+    options:{ scales:{ y:{ stacked:true }, x:{ ticks:{ maxTicksLimit:8 } } }, interaction:{ mode:'index', intersect:false } } });
+  draw('c-solar', { type:'scatter', data:{ datasets:[{ label:'heure', data: rows.filter(r => r.shortwave_radiation_wm2 != null)
+      .map(r => ({ x:Number(r.shortwave_radiation_wm2), y:Number(r.solar_mw || 0) })), backgroundColor:'#f5d547' }] },
+    options:{ plugins:{ legend:{ display:false } }, scales:{ x:{ title:{ display:true, text:'Rayonnement W/m²' } },
+      y:{ title:{ display:true, text:'Solaire MW' } } } } });
+
+  table($('t-sla'), sla.sort((a, b) => ({breach:0, warning:1, ok:2}[a.status] - {breach:0, warning:1, ok:2}[b.status])),
+    [['Contrôle', r => r.check_name], ['Cible', r => r.target], ['Statut', r => pill(r.status)],
+     ['Mesure', r => num(r.measured)], ['Seuil', r => num(r.threshold)], ['Détail', r => r.details], ['Vérifié', r => fmt(r.checked_at)]]);
+  table($('t-inc'), inc, [['#', r => r.incident_id], ['Contrôle', r => r.check_name], ['Cible', r => r.target],
+     ['Gravité', r => pill(r.severity)], ['Ouvert', r => fmt(r.opened_at)],
+     ['Résolu', r => r.resolved_at ? fmt(r.resolved_at) : pill('open')], ['Vu', r => r.occurrences + '×']]);
+  table($('t-src'), pipe.sources || [], [['Source', r => r.source], ['État', r => pill(r.state)],
+     ['Échecs', r => r.consecutive_failures], ['Dernier succès', r => fmt(r.last_success_at)]]);
+  table($('t-runs'), pipe.last_runs || [], [['#', r => r.run_id], ['Source', r => r.source], ['Mode', r => r.mode],
+     ['Statut', r => pill(r.status)], ['Lignes', r => `${r.rows_valid} ok / ${r.rows_rejected} rejet`],
+     ['Début', r => fmt(r.started_at)], ['Erreur', r => r.error || '']]);
+}
+$('refresh').onclick = load; $('ba').onchange = load; load(); setInterval(load, 60000);
+</script>
+</body>
+</html>
